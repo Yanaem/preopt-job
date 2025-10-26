@@ -1,0 +1,5 @@
+pymupdf
+opencv-python-headless
+pillow
+numpy
+google-cloud-storage
