@@ -1,0 +1,22 @@
+# cloudbuild.yaml
+
+# => OBLIGATOIRE quand un service account est défini côté déclencheur
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _AR_IMAGE: us-central1-docker.pkg.dev/$PROJECT_ID/jobs-preopt/preopt
+  _TAG: $SHORT_SHA
+
+steps:
+  # Build l'image
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', '${_AR_IMAGE}:${_TAG}', '.']
+
+  # Tag "latest" en plus (optionnel)
+  - name: gcr.io/cloud-builders/docker
+    args: ['tag', '${_AR_IMAGE}:${_TAG}', '${_AR_IMAGE}:latest']
+
+images:
+  - '${_AR_IMAGE}:${_TAG}'
+  - '${_AR_IMAGE}:latest'
