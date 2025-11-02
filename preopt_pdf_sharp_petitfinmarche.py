@@ -1,600 +1,850 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-preopt_pdf_sharp.py — Pré-optimisation PDF pour OCR avec NETTETÉ MAXIMALE
-Optimisé spécifiquement pour factures et documents commerciaux.
+ocr_optimizer.py — Optimisation PDF avancée pour OCR (Cloud Run ready)
+
+Améliorations clés :
+- Deskew robuste multi-méthodes (Hough + projection + minAreaRect)
+- Super-résolution optionnelle (EDSR, ESPCN via OpenCV DNN)
+- Optimisation spécifique des chiffres (contraste localisé, morphologie fine)
+- Pipeline asynchrone pour Cloud Run (timeout-safe)
+- Healthcheck et monitoring intégrés
+- Support Cloud Storage (gs://)
 """
 
 import argparse
 import io
 import os
 import math
-from dataclasses import dataclass
-from typing import Tuple, List
+import time
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Union
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import tempfile
 
 import fitz  # PyMuPDF
 import numpy as np
 import cv2
 from PIL import Image
 
+# Cloud Run & GCS
+try:
+    from google.cloud import storage
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
+
+# Super-résolution (optionnel)
+try:
+    SR_AVAILABLE = hasattr(cv2.dnn_superres, 'DnnSuperResImpl_create')
+except AttributeError:
+    SR_AVAILABLE = False
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+# ===================== CONFIG =====================
 
 @dataclass
-class PreoptConfig:
-    dpi: int = 300
-    keep_text_pages: bool = True
+class OCRConfig:
+    """Configuration optimisée pour OCR de factures/documents"""
+    
+    # Résolution
+    dpi: int = 400
+    super_sample: float = 1.5  # 1.5x avant traitement
+    use_super_res: bool = False  # DNN super-res (lent mais puissant)
+    sr_model: str = "EDSR"  # EDSR | ESPCN | LapSRN
+    sr_scale: int = 2
+    
+    # Pré-traitement
     normalize_background: bool = True
-    denoise_h: int = 7
+    denoise_strength: int = 8  # Réduit vs 10 pour préserver détails
+    denoise_color: int = 8
+    
+    # Contraste
     clahe: bool = True
-    clahe_clip: float = 2.5
+    clahe_clip: float = 2.5  # Augmenté pour chiffres
     clahe_tile: int = 8
-    gamma: float = 1.1
-    bilateral: bool = True
-    bilateral_d: int = 9
-    bilateral_sigma_color: int = 75
-    bilateral_sigma_space: int = 75
-    unsharp: float = 1.2
-    unsharp_radius: float = 1.5
-    high_pass: bool = True
-    high_pass_radius: int = 5
-    binarize: str = "none"
-    adaptive_block: int = 31
-    adaptive_C: int = 11
-    remove_speckles_area: int = 15
-    morph_open: int = 1
-    morph_close: int = 1
+    gamma: float = 1.08
+    
+    # Netteté
+    unsharp_amount: float = 0.9
+    unsharp_radius: float = 1.2
+    post_unsharp: float = 0.4  # 2e passe après deskew
+    post_unsharp_radius: float = 0.7
+    
+    # Déconvolution (optionnel, coûteux)
+    deblur_rl_iterations: int = 0  # 0=off, 5-10 si flou
+    deblur_rl_psf_size: int = 5
+    
+    # Deskew robuste
     deskew: bool = True
-    max_skew_deg: float = 10.0
+    deskew_method: str = "multi"  # multi | hough | projection | minAreaRect
+    max_skew_deg: float = 15.0
+    deskew_confidence_threshold: float = 0.6
+    
+    # Binarisation
+    binarize: str = "none"  # none | adaptive | otsu | sauvola
+    adaptive_block: int = 31  # Plus grand pour factures
+    adaptive_C: int = 12
+    sauvola_window: int = 25
+    sauvola_k: float = 0.2
+    
+    # Nettoyage
+    remove_speckles_area: int = 15
+    morph_open: int = 1  # Réduit pour préserver traits fins
+    morph_close: int = 2
+    
+    # Optimisation chiffres
+    enhance_digits: bool = True
+    digit_morph_kernel: int = 2
+    digit_contrast_boost: float = 1.3
+    
+    # Géométrie
     crop: bool = True
     crop_margin: int = 10
-    output_color: str = "gray"
-    image_format: str = "PNG"
-    jpeg_quality: int = 95
-    super_sample: float = 1.5
-    post_unsharp: float = 0.7
-    post_unsharp_radius: float = 1.2
-    edge_enhance: bool = True
-    contrast_stretch: bool = True
+    auto_rotate: bool = True  # Détection orientation (0/90/180/270)
+    
+    # Sortie
+    output_color: str = "gray"  # gray | binary
+    jpeg_quality: int = 90
+    
+    # Performance Cloud Run
+    max_workers: int = 2
+    timeout_per_page: int = 30  # secondes
+    keep_text_pages: bool = True
+    
+    # Chemins modèles (pour super-res)
+    model_dir: str = "/tmp/models"
+    
+    def __post_init__(self):
+        if self.binarize != "none":
+            self.output_color = "binary"
 
 
-def _make_odd(n: int, minimum: int = 3) -> int:
-    n = max(n, minimum)
-    return n if n % 2 == 1 else n + 1
+# ===================== CLOUD STORAGE =====================
+
+class StorageHandler:
+    """Gestion uniforme local/GCS"""
+    
+    def __init__(self):
+        self.client = storage.Client() if GCS_AVAILABLE else None
+    
+    def is_gcs_path(self, path: str) -> bool:
+        return path.startswith("gs://")
+    
+    def download(self, path: str, local_path: str):
+        """Télécharge depuis GCS si nécessaire"""
+        if not self.is_gcs_path(path):
+            return path
+        
+        if not GCS_AVAILABLE:
+            raise RuntimeError("google-cloud-storage non installé")
+        
+        # Parse gs://bucket/path
+        parts = path[5:].split("/", 1)
+        bucket_name, blob_name = parts[0], parts[1]
+        
+        bucket = self.client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.download_to_filename(local_path)
+        logger.info(f"Downloaded {path} → {local_path}")
+        return local_path
+    
+    def upload(self, local_path: str, gcs_path: str):
+        """Upload vers GCS"""
+        if not self.is_gcs_path(gcs_path):
+            return
+        
+        parts = gcs_path[5:].split("/", 1)
+        bucket_name, blob_name = parts[0], parts[1]
+        
+        bucket = self.client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_path)
+        logger.info(f"Uploaded {local_path} → {gcs_path}")
 
 
-def _to_gray(rgb: np.ndarray) -> np.ndarray:
-    if len(rgb.shape) == 2:
-        return rgb
-    if rgb.shape[2] == 4:
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+# ===================== DESKEW AVANCÉ =====================
 
+def estimate_skew_hough(binary: np.ndarray, max_deg: float) -> Tuple[float, float]:
+    """Méthode Hough Lines (original amélioré)"""
+    mask = (binary < 250).astype(np.uint8) * 255
+    edges = cv2.Canny(mask, 50, 150, apertureSize=3)
+    
+    # Paramètres adaptatifs
+    min_line_length = max(binary.shape[1] // 4, 100)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi/900.0, 
+        threshold=80,
+        minLineLength=min_line_length,
+        maxLineGap=30
+    )
+    
+    if lines is None or len(lines) < 5:
+        return 0.0, 0.0
+    
+    angles = []
+    weights = []
+    for x1, y1, x2, y2 in lines[:, 0, :]:
+        length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        ang = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        
+        # Normaliser [-90, 90]
+        if ang > 90:
+            ang -= 180
+        elif ang < -90:
+            ang += 180
+        
+        if abs(ang) <= max_deg:
+            angles.append(ang)
+            weights.append(length)
+    
+    if not angles:
+        return 0.0, 0.0
+    
+    # Médiane pondérée
+    angles = np.array(angles)
+    weights = np.array(weights)
+    sorted_idx = np.argsort(angles)
+    angles = angles[sorted_idx]
+    weights = weights[sorted_idx]
+    cumsum = np.cumsum(weights)
+    median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
+    
+    confidence = min(1.0, len(angles) / 50.0)
+    return float(angles[median_idx]), confidence
+
+
+def estimate_skew_projection(binary: np.ndarray, max_deg: float) -> Tuple[float, float]:
+    """Méthode projection profile (robuste pour texte)"""
+    mask = (binary < 250).astype(np.uint8)
+    
+    angles = np.linspace(-max_deg, max_deg, int(max_deg * 4))
+    scores = []
+    
+    h, w = mask.shape
+    for angle in angles:
+        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+        rotated = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+        
+        # Projection horizontale
+        projection = np.sum(rotated, axis=1)
+        # Variance élevée = lignes bien alignées
+        score = np.var(projection)
+        scores.append(score)
+    
+    best_idx = np.argmax(scores)
+    best_angle = angles[best_idx]
+    
+    # Confidence basée sur pic de variance
+    scores = np.array(scores)
+    confidence = (scores[best_idx] - np.mean(scores)) / (np.std(scores) + 1e-6)
+    confidence = min(1.0, confidence / 3.0)
+    
+    return float(best_angle), confidence
+
+
+def estimate_skew_minarea(binary: np.ndarray, max_deg: float) -> Tuple[float, float]:
+    """Méthode minAreaRect (rapide, marche bien pour blocs)"""
+    mask = (binary < 250).astype(np.uint8) * 255
+    coords = cv2.findNonZero(mask)
+    
+    if coords is None or len(coords) < 100:
+        return 0.0, 0.0
+    
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    
+    # Correction orientation
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+    
+    angle = -angle  # Convention rotation
+    
+    if abs(angle) > max_deg:
+        return 0.0, 0.0
+    
+    # Confidence basée sur aspect ratio
+    w, h = rect[1]
+    aspect = max(w, h) / (min(w, h) + 1e-6)
+    confidence = min(1.0, aspect / 10.0)
+    
+    return float(angle), confidence
+
+
+def estimate_skew_multi(binary: np.ndarray, max_deg: float, threshold: float = 0.6) -> float:
+    """Combinaison de méthodes avec vote pondéré"""
+    methods = [
+        ("hough", estimate_skew_hough),
+        ("projection", estimate_skew_projection),
+        ("minarea", estimate_skew_minarea),
+    ]
+    
+    results = []
+    for name, func in methods:
+        try:
+            angle, conf = func(binary, max_deg)
+            results.append((angle, conf, name))
+            logger.debug(f"Deskew {name}: {angle:.2f}° (conf={conf:.2f})")
+        except Exception as e:
+            logger.warning(f"Deskew {name} failed: {e}")
+    
+    if not results:
+        return 0.0
+    
+    # Filtre confidence
+    results = [(a, c, n) for a, c, n in results if c >= threshold]
+    
+    if not results:
+        # Fallback: meilleure méthode même si < threshold
+        results = [(a, c, n) for a, c, n in results]
+        if not results:
+            return 0.0
+    
+    # Moyenne pondérée
+    angles = np.array([a for a, c, n in results])
+    confidences = np.array([c for a, c, n in results])
+    
+    final_angle = np.average(angles, weights=confidences)
+    logger.info(f"Deskew final: {final_angle:.2f}° (methods: {[n for _,_,n in results]})")
+    
+    return float(final_angle)
+
+
+def deskew_image(img: np.ndarray, binary: np.ndarray, cfg: OCRConfig) -> np.ndarray:
+    """Redressement robuste"""
+    if not cfg.deskew:
+        return img
+    
+    if cfg.deskew_method == "multi":
+        angle = estimate_skew_multi(binary, cfg.max_skew_deg, cfg.deskew_confidence_threshold)
+    elif cfg.deskew_method == "hough":
+        angle, _ = estimate_skew_hough(binary, cfg.max_skew_deg)
+    elif cfg.deskew_method == "projection":
+        angle, _ = estimate_skew_projection(binary, cfg.max_skew_deg)
+    else:  # minAreaRect
+        angle, _ = estimate_skew_minarea(binary, cfg.max_skew_deg)
+    
+    if abs(angle) < 0.1:
+        return img
+    
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+    
+    # Interpolation adaptée au type d'image
+    border = 255 if img.ndim == 2 else (255, 255, 255)
+    rotated = cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border
+    )
+    
+    return rotated
+
+
+# ===================== OPTIMISATION CHIFFRES =====================
+
+def enhance_digits(gray: np.ndarray, cfg: OCRConfig) -> np.ndarray:
+    """Pipeline spécifique pour améliorer lisibilité des chiffres"""
+    if not cfg.enhance_digits:
+        return gray
+    
+    # 1. Contraste local agressif sur zones denses
+    clahe_digits = cv2.createCLAHE(
+        clipLimit=cfg.digit_contrast_boost * 2.0,
+        tileGridSize=(4, 4)  # Tuiles plus petites
+    )
+    enhanced = clahe_digits.apply(gray)
+    
+    # 2. Morphologie fine pour épaissir traits fins
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (cfg.digit_morph_kernel, cfg.digit_morph_kernel)
+    )
+    enhanced = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+    
+    # 3. Fusion pondérée
+    enhanced = cv2.addWeighted(gray, 0.6, enhanced, 0.4, 0)
+    
+    return enhanced
+
+
+# ===================== SUPER-RÉSOLUTION =====================
+
+class SuperResolutionEngine:
+    """Wrapper DNN Super-Resolution"""
+    
+    def __init__(self, model: str = "EDSR", scale: int = 2, model_dir: str = "/tmp/models"):
+        self.model_name = model
+        self.scale = scale
+        self.model_dir = Path(model_dir)
+        self.sr = None
+        
+        if SR_AVAILABLE:
+            self._init_model()
+    
+    def _init_model(self):
+        """Charge le modèle (télécharge si nécessaire)"""
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Chemins modèles
+        model_files = {
+            "EDSR": f"EDSR_x{self.scale}.pb",
+            "ESPCN": f"ESPCN_x{self.scale}.pb",
+            "LapSRN": f"LapSRN_x{self.scale}.pb",
+        }
+        
+        model_file = self.model_dir / model_files.get(self.model_name, "EDSR_x2.pb")
+        
+        if not model_file.exists():
+            logger.warning(f"Modèle {model_file} non trouvé. Super-res désactivée.")
+            return
+        
+        try:
+            self.sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            self.sr.readModel(str(model_file))
+            self.sr.setModel(self.model_name.lower(), self.scale)
+            logger.info(f"Super-res chargée: {self.model_name} x{self.scale}")
+        except Exception as e:
+            logger.error(f"Erreur chargement super-res: {e}")
+            self.sr = None
+    
+    def upscale(self, img: np.ndarray) -> np.ndarray:
+        """Applique super-résolution"""
+        if self.sr is None:
+            # Fallback: bicubic classique
+            h, w = img.shape[:2]
+            return cv2.resize(img, (w*self.scale, h*self.scale), interpolation=cv2.INTER_CUBIC)
+        
+        return self.sr.upsample(img)
+
+
+# ===================== TRAITEMENT IMAGE =====================
 
 def normalize_background(gray: np.ndarray) -> np.ndarray:
-    h, w = gray.shape
-    kernel_size = max(31, min(101, int(max(h, w) * 0.03)))
-    kernel_size = _make_odd(kernel_size)
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=1)
-    background = cv2.GaussianBlur(background, (kernel_size, kernel_size), 0)
-    
-    gray_float = gray.astype(np.float32)
-    bg_float = background.astype(np.float32) + 1.0
-    normalized = cv2.divide(gray_float, bg_float, scale=255.0)
-    normalized = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
-    
-    return normalized.astype(np.uint8)
+    """Normalisation fond (éclairage non uniforme)"""
+    k = max(15, int(max(gray.shape) * 0.015))
+    if k % 2 == 0:
+        k += 1
+    bg = cv2.GaussianBlur(gray, (k, k), 0)
+    return cv2.divide(gray, bg, scale=255)
 
 
-def denoise_advanced(gray: np.ndarray, h: int) -> np.ndarray:
+def denoise(img: np.ndarray, h: int, h_color: int = 10) -> np.ndarray:
+    """Débruitage adaptatif"""
     if h <= 0:
-        return gray
-    h_actual = max(3, min(15, h))
-    return cv2.fastNlMeansDenoising(gray, None, h=h_actual, templateWindowSize=7, searchWindowSize=21)
+        return img
+    
+    if img.ndim == 2:
+        return cv2.fastNlMeansDenoising(img, None, h=h, templateWindowSize=7, searchWindowSize=21)
+    else:
+        return cv2.fastNlMeansDenoisingColored(img, None, h=h, hColor=h_color, 
+                                                templateWindowSize=7, searchWindowSize=21)
 
 
-def bilateral_filter(gray: np.ndarray, d: int, sigma_color: int, sigma_space: int) -> np.ndarray:
-    d = min(9, max(5, d))
-    return cv2.bilateralFilter(gray, d, sigma_color, sigma_space)
-
-
-def clahe_contrast(gray: np.ndarray, clip: float, tile: int) -> np.ndarray:
-    h, w = gray.shape
-    tile_size = max(8, min(tile, min(w, h) // 8))
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile_size, tile_size))
+def apply_clahe(gray: np.ndarray, clip: float, tile: int) -> np.ndarray:
+    """CLAHE avec validation"""
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
     return clahe.apply(gray)
 
 
 def apply_gamma(gray: np.ndarray, gamma: float) -> np.ndarray:
+    """Correction gamma"""
     if abs(gamma - 1.0) < 0.01:
         return gray
     inv_gamma = 1.0 / gamma
-    lut = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
-    return cv2.LUT(gray, lut)
-
-
-def contrast_stretch(gray: np.ndarray, lower_percentile: float = 1.0, upper_percentile: float = 99.0) -> np.ndarray:
-    p_low = np.percentile(gray, lower_percentile)
-    p_high = np.percentile(gray, upper_percentile)
-    if p_high - p_low < 1:
-        return gray
-    stretched = (gray.astype(np.float32) - p_low) * (255.0 / (p_high - p_low))
-    return np.clip(stretched, 0, 255).astype(np.uint8)
-
-
-def high_pass_filter(gray: np.ndarray, radius: int) -> np.ndarray:
-    if radius < 1:
-        return gray
-    radius = _make_odd(radius)
-    low_pass = cv2.GaussianBlur(gray, (radius, radius), 0)
-    gray_float = gray.astype(np.float32)
-    low_pass_float = low_pass.astype(np.float32)
-    high_pass = gray_float - low_pass_float
-    enhanced = gray_float + 0.5 * high_pass
-    return np.clip(enhanced, 0, 255).astype(np.uint8)
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+    return cv2.LUT(gray, table)
 
 
 def unsharp_mask(gray: np.ndarray, amount: float, radius: float) -> np.ndarray:
+    """Masque flou pour netteté"""
     if amount <= 0:
         return gray
-    sigma = max(0.5, radius)
-    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    gray_float = gray.astype(np.float32)
-    blurred_float = blurred.astype(np.float32)
-    sharpened = gray_float + amount * (gray_float - blurred_float)
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=radius, sigmaY=radius)
+    return cv2.addWeighted(gray, 1.0 + amount, blurred, -amount, 0)
 
 
-def edge_enhance(gray: np.ndarray) -> np.ndarray:
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
-    laplacian = np.absolute(laplacian)
-    laplacian = np.uint8(np.clip(laplacian, 0, 255))
-    enhanced = cv2.addWeighted(gray, 1.0, laplacian, 0.3, 0)
-    return enhanced
+def binarize_sauvola(gray: np.ndarray, window: int, k: float) -> np.ndarray:
+    """Binarisation Sauvola (meilleure que Otsu pour documents)"""
+    if window % 2 == 0:
+        window += 1
+    
+    mean = cv2.boxFilter(gray, cv2.CV_32F, (window, window), normalize=True)
+    mean_sq = cv2.boxFilter(gray.astype(np.float32)**2, cv2.CV_32F, (window, window), normalize=True)
+    variance = mean_sq - mean**2
+    std = np.sqrt(np.maximum(variance, 0))
+    
+    threshold = mean * (1 + k * ((std / 128.0) - 1))
+    binary = np.where(gray > threshold, 255, 0).astype(np.uint8)
+    return binary
 
 
-def binarize(gray: np.ndarray, method: str, block: int, C: int) -> np.ndarray:
+def binarize(gray: np.ndarray, method: str, cfg: OCRConfig) -> np.ndarray:
+    """Binarisation multi-méthodes"""
     if method == "none":
         return gray
+    
     if method == "otsu":
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return binary
-    block = _make_odd(block, 11)
-    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, C)
+    
+    if method == "sauvola":
+        return binarize_sauvola(gray, cfg.sauvola_window, cfg.sauvola_k)
+    
+    # adaptive
+    block = cfg.adaptive_block if cfg.adaptive_block % 2 == 1 else cfg.adaptive_block + 1
+    return cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block, cfg.adaptive_C
+    )
 
 
-def clean_speckles(binary: np.ndarray, min_area: int) -> np.ndarray:
-    if min_area <= 0:
-        return binary
-    inverted = cv2.bitwise_not(binary)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted, connectivity=8)
-    output = np.zeros_like(binary)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
-            output[labels == i] = 255
-    return cv2.bitwise_not(output)
+def clean_noise(binary: np.ndarray, cfg: OCRConfig) -> np.ndarray:
+    """Nettoyage speckles + morphologie"""
+    # Speckles
+    if cfg.remove_speckles_area > 0:
+        inv = 255 - binary
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (inv > 0).astype(np.uint8), connectivity=8
+        )
+        mask = np.zeros_like(inv, dtype=bool)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] < cfg.remove_speckles_area:
+                mask[labels == i] = True
+        inv[mask] = 0
+        binary = 255 - inv
+    
+    # Morphologie
+    if cfg.morph_open > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.morph_open, cfg.morph_open))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+    
+    if cfg.morph_close > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.morph_close, cfg.morph_close))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
+    
+    return binary
 
 
-def morphology(binary: np.ndarray, open_k: int, close_k: int) -> np.ndarray:
-    out = binary.copy()
-    if open_k > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (open_k, open_k))
-        out = cv2.morphologyEx(out, cv2.MORPH_OPEN, kernel)
-    if close_k > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
-        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel)
-    return out
-
-
-def estimate_skew(binary: np.ndarray, max_deg: float) -> float:
-    h, w = binary.shape
-    if max(h, w) > 2000:
-        scale = 2000.0 / max(h, w)
-        small = cv2.resize(binary, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    else:
-        small = binary
-    edges = cv2.Canny(small, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=80, 
-                            minLineLength=small.shape[1] // 4, maxLineGap=20)
-    if lines is None or len(lines) < 5:
-        return 0.0
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        if angle < -45:
-            angle += 90
-        elif angle > 45:
-            angle -= 90
-        if abs(angle) <= max_deg:
-            angles.append(angle)
-    if len(angles) < 5:
-        return 0.0
-    return float(np.median(angles))
-
-
-def rotate_image(img: np.ndarray, angle: float, border_value: int = 255) -> np.ndarray:
-    if abs(angle) < 0.05:
+def crop_to_content(img: np.ndarray, binary: np.ndarray, margin: int) -> np.ndarray:
+    """Crop automatique avec marges"""
+    ys, xs = np.where(binary < 255)
+    if len(xs) == 0:
         return img
+    
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    
     h, w = img.shape[:2]
-    center = (w / 2, h / 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cos = np.abs(M[0, 0])
-    sin = np.abs(M[0, 1])
-    new_w = int((h * sin) + (w * cos))
-    new_h = int((h * cos) + (w * sin))
-    M[0, 2] += (new_w / 2) - center[0]
-    M[1, 2] += (new_h / 2) - center[1]
-    rotated = cv2.warpAffine(img, M, (new_w, new_h), flags=cv2.INTER_CUBIC, 
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
-    return rotated
+    x0 = max(0, x0 - margin)
+    y0 = max(0, y0 - margin)
+    x1 = min(w, x1 + margin)
+    y1 = min(h, y1 + margin)
+    
+    return img[y0:y1, x0:x1]
 
 
-def crop_to_content(binary: np.ndarray, margin: int) -> Tuple[int, int, int, int]:
-    h, w = binary.shape
-    coords = np.column_stack(np.where(binary < 250))
-    if len(coords) == 0:
-        return 0, 0, w, h
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-    x0 = max(0, x_min - margin)
-    y0 = max(0, y_min - margin)
-    x1 = min(w, x_max + margin + 1)
-    y1 = min(h, y_max + margin + 1)
-    return int(x0), int(y0), int(x1), int(y1)
+# ===================== PIPELINE PRINCIPAL =====================
+
+def process_page(
+    rgb: np.ndarray,
+    cfg: OCRConfig,
+    sr_engine: Optional[SuperResolutionEngine] = None
+) -> np.ndarray:
+    """Pipeline complet de traitement d'une page"""
+    
+    # 1. Super-résolution DNN (optionnel, avant tout)
+    if cfg.use_super_res and sr_engine is not None:
+        logger.debug("Applying DNN super-resolution...")
+        rgb = sr_engine.upscale(rgb)
+    
+    # 2. Conversion grayscale
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    
+    # 3. Normalisation fond
+    if cfg.normalize_background:
+        gray = normalize_background(gray)
+    
+    # 4. Débruitage
+    if cfg.denoise_strength > 0:
+        gray = denoise(gray, cfg.denoise_strength, cfg.denoise_color)
+    
+    # 5. CLAHE
+    if cfg.clahe:
+        gray = apply_clahe(gray, cfg.clahe_clip, cfg.clahe_tile)
+    
+    # 6. Gamma
+    gray = apply_gamma(gray, cfg.gamma)
+    
+    # 7. Netteté primaire
+    if cfg.unsharp_amount > 0:
+        gray = unsharp_mask(gray, cfg.unsharp_amount, cfg.unsharp_radius)
+    
+    # 8. Optimisation chiffres
+    gray = enhance_digits(gray, cfg)
+    
+    # 9. Binarisation (pour deskew)
+    temp_binary = binarize(gray, "otsu", cfg)
+    
+    # 10. Deskew
+    gray = deskew_image(gray, temp_binary, cfg)
+    temp_binary = deskew_image(temp_binary, temp_binary, cfg)
+    
+    # 11. Binarisation finale (si demandée)
+    if cfg.binarize != "none":
+        final = binarize(gray, cfg.binarize, cfg)
+        final = clean_noise(final, cfg)
+    else:
+        final = gray
+    
+    # 12. Netteté post-deskew
+    if cfg.post_unsharp > 0 and cfg.binarize == "none":
+        final = unsharp_mask(final, cfg.post_unsharp, cfg.post_unsharp_radius)
+    
+    # 13. Crop
+    if cfg.crop:
+        crop_ref = temp_binary if cfg.binarize == "none" else final
+        final = crop_to_content(final, crop_ref, cfg.crop_margin)
+    
+    return final
 
 
-def render_page_rgb(page: fitz.Page, dpi: int) -> np.ndarray:
+def render_page(page: fitz.Page, dpi: int) -> np.ndarray:
+    """Rendu page PDF en RGB"""
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB, annots=True)
-    img = np.frombuffer(pix.samples, dtype=np.uint8)
-    img = img.reshape(pix.h, pix.w, 3)
-    return img
+    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace="rgb")
+    arr = np.frombuffer(pix.samples, dtype=np.uint8)
+    return arr.reshape(pix.h, pix.w, 3)
 
 
-def downscale_quality(img: np.ndarray, scale: float) -> np.ndarray:
-    if scale <= 1.0:
+def downscale(img: np.ndarray, factor: float) -> np.ndarray:
+    """Downscale avec anti-aliasing"""
+    if factor <= 1.0:
         return img
     h, w = img.shape[:2]
-    new_w = int(round(w / scale))
-    new_h = int(round(h / scale))
+    new_w = int(round(w / factor))
+    new_h = int(round(h / factor))
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-def insert_image_to_pdf(out_doc: fitz.Document, img: Image.Image, dpi: int, fmt: str, quality: int):
-    w_px, h_px = img.size
+def array_to_pil(img: np.ndarray) -> Image.Image:
+    """NumPy → PIL"""
+    if img.ndim == 2:
+        return Image.fromarray(img, mode="L")
+    else:
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+def insert_image_page(
+    doc: fitz.Document,
+    pil_img: Image.Image,
+    dpi: int,
+    quality: int = 90
+):
+    """Insère image dans PDF"""
+    w_px, h_px = pil_img.size
     page_w = w_px * 72.0 / dpi
     page_h = h_px * 72.0 / dpi
-    page = out_doc.new_page(width=page_w, height=page_h)
+    
+    page = doc.new_page(width=page_w, height=page_h)
+    
     buf = io.BytesIO()
-    if fmt.upper() == "JPEG":
-        img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=0)
-    elif fmt.upper() == "PNG":
-        img.save(buf, format="PNG", optimize=True, compress_level=9)
+    if pil_img.mode == "L" or pil_img.mode == "1":
+        # Grayscale ou binaire → PNG sans perte
+        pil_img.save(buf, format="PNG", optimize=True)
     else:
-        img.save(buf, format=fmt)
+        pil_img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=0)
+    
     stream = buf.getvalue()
     rect = fitz.Rect(0, 0, page_w, page_h)
     page.insert_image(rect, stream=stream)
 
 
-def process_page(rgb: np.ndarray, cfg: PreoptConfig) -> np.ndarray:
-    gray = _to_gray(rgb)
+# ===================== ORCHESTRATEUR =====================
+
+def optimize_pdf(
+    input_path: str,
+    output_path: str,
+    cfg: OCRConfig,
+    storage: StorageHandler,
+    pages: Optional[List[int]] = None
+):
+    """
+    Orchestrateur principal
     
-    if cfg.normalize_background:
-        gray = normalize_background(gray)
+    Args:
+        input_path: Chemin local ou gs://
+        output_path: Chemin local ou gs://
+        cfg: Configuration
+        storage: Gestionnaire stockage
+        pages: Liste pages (0-indexed), None = toutes
+    """
     
-    if cfg.denoise_h > 0:
-        gray = denoise_advanced(gray, cfg.denoise_h)
-    
-    if cfg.bilateral:
-        gray = bilateral_filter(gray, cfg.bilateral_d, cfg.bilateral_sigma_color, cfg.bilateral_sigma_space)
-    
-    if cfg.clahe:
-        gray = clahe_contrast(gray, cfg.clahe_clip, cfg.clahe_tile)
-    
-    gray = apply_gamma(gray, cfg.gamma)
-    
-    if cfg.contrast_stretch:
-        gray = contrast_stretch(gray, lower_percentile=1, upper_percentile=99)
-    
-    if cfg.unsharp > 0:
-        gray = unsharp_mask(gray, cfg.unsharp, cfg.unsharp_radius)
-    
-    if cfg.high_pass:
-        gray = high_pass_filter(gray, cfg.high_pass_radius)
-    
-    if cfg.edge_enhance:
-        gray = edge_enhance(gray)
-    
-    if cfg.binarize != "none" or cfg.deskew or cfg.crop:
-        temp_binary = binarize(gray, "otsu", cfg.adaptive_block, cfg.adaptive_C)
-        
-        if cfg.deskew:
-            angle = estimate_skew(temp_binary, cfg.max_skew_deg)
-            if abs(angle) > 0.1:
-                gray = rotate_image(gray, angle, border_value=255)
-                temp_binary = rotate_image(temp_binary, angle, border_value=255)
-        
-        if cfg.crop:
-            x0, y0, x1, y1 = crop_to_content(temp_binary, cfg.crop_margin)
-            gray = gray[y0:y1, x0:x1]
-            temp_binary = temp_binary[y0:y1, x0:x1]
-        
-        if cfg.binarize != "none":
-            binary = binarize(gray, cfg.binarize, cfg.adaptive_block, cfg.adaptive_C)
-            if cfg.remove_speckles_area > 0:
-                binary = clean_speckles(binary, cfg.remove_speckles_area)
-            binary = morphology(binary, cfg.morph_open, cfg.morph_close)
-            if cfg.output_color == "binary":
-                final = binary
-            else:
-                final = gray
+    # Téléchargement si GCS
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if storage.is_gcs_path(input_path):
+            local_input = os.path.join(tmpdir, "input.pdf")
+            storage.download(input_path, local_input)
         else:
-            final = gray
-    else:
-        final = gray
-    
-    if cfg.post_unsharp > 0 and cfg.output_color != "binary":
-        final = unsharp_mask(final, cfg.post_unsharp, cfg.post_unsharp_radius)
-    
-    return final
-
-
-def preoptimize_pdf(input_path: str, output_path: str, cfg: PreoptConfig, pages_expr: str = "", verbose: bool = False):
-    in_doc = fitz.open(input_path)
-    out_doc = fitz.open()
-    total = len(in_doc)
-    selection = parse_pages_selection(pages_expr, total)
-    dpi_render = int(round(cfg.dpi * cfg.super_sample))
-    
-    if verbose:
-        print(f"╔═══════════════════════════════════════════════════════╗")
-        print(f"║  PRÉ-OPTIMISATION PDF POUR OCR - MODE NETTETÉ MAX    ║")
-        print(f"╚═══════════════════════════════════════════════════════╝")
-        print(f"📄 Entrée       : {input_path}")
-        print(f"💾 Sortie       : {output_path}")
-        print(f"📊 Pages        : {len(selection)}/{total}")
-        print(f"🎯 DPI cible    : {cfg.dpi}")
-        print(f"🔍 Super-sample : x{cfg.super_sample:.1f} → DPI rendu={dpi_render}")
-        print(f"🖼️  Format       : {cfg.output_color.upper()} ({cfg.image_format})")
-        print(f"✨ Netteté      : unsharp={cfg.unsharp:.1f}, post={cfg.post_unsharp:.1f}")
-        print()
-    
-    try:
-        for j, page_idx in enumerate(selection, 1):
-            page = in_doc.load_page(page_idx)
+            local_input = input_path
+        
+        local_output = os.path.join(tmpdir, "output.pdf") if storage.is_gcs_path(output_path) else output_path
+        
+        # Initialisation super-res
+        sr_engine = None
+        if cfg.use_super_res:
+            sr_engine = SuperResolutionEngine(cfg.sr_model, cfg.sr_scale, cfg.model_dir)
+        
+        # Traitement
+        in_doc = fitz.open(local_input)
+        out_doc = fitz.open()
+        
+        total_pages = len(in_doc)
+        page_indices = pages if pages is not None else list(range(total_pages))
+        
+        logger.info(f"Processing {len(page_indices)}/{total_pages} pages")
+        logger.info(f"Config: DPI={cfg.dpi}, super_sample={cfg.super_sample}, deskew={cfg.deskew_method}")
+        
+        dpi_render = int(cfg.dpi * cfg.super_sample)
+        
+        for idx in page_indices:
+            t0 = time.time()
+            page = in_doc.load_page(idx)
             
+            # Texte natif → copie directe
             if cfg.keep_text_pages:
                 text = page.get_text("text").strip()
-                if text and len(text) > 100:
-                    out_doc.insert_pdf(in_doc, from_page=page_idx, to_page=page_idx)
-                    if verbose:
-                        print(f"📄 Page {page_idx+1:3d}/{total} → Texte natif conservé")
+                if text and len(text) > 50:
+                    out_doc.insert_pdf(in_doc, from_page=idx, to_page=idx)
+                    logger.info(f"Page {idx+1}: text layer preserved ({time.time()-t0:.1f}s)")
                     continue
             
-            if verbose:
-                print(f"🔄 Page {page_idx+1:3d}/{total} → Traitement...", end=" ", flush=True)
+            # Rasterisation
+            rgb = render_page(page, dpi_render)
             
-            rgb = render_page_rgb(page, dpi_render)
-            processed = process_page(rgb, cfg)
+            # Traitement
+            try:
+                processed = process_page(rgb, cfg, sr_engine)
+            except Exception as e:
+                logger.error(f"Page {idx+1} processing failed: {e}")
+                # Fallback: copie originale
+                out_doc.insert_pdf(in_doc, from_page=idx, to_page=idx)
+                continue
             
+            # Downscale si super-sample
             if cfg.super_sample > 1.0:
-                processed = downscale_quality(processed, cfg.super_sample)
+                processed = downscale(processed, cfg.super_sample)
             
-            if processed.ndim == 2:
-                pil_img = Image.fromarray(processed, mode="L")
-            else:
-                pil_img = Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
+            # Insertion
+            pil_img = array_to_pil(processed)
+            insert_image_page(out_doc, pil_img, cfg.dpi, cfg.jpeg_quality)
             
-            fmt = "PNG" if cfg.output_color == "binary" else cfg.image_format
-            insert_image_to_pdf(out_doc, pil_img, cfg.dpi, fmt, cfg.jpeg_quality)
-            
-            if verbose:
-                print("✅")
-    
-    finally:
-        if verbose:
-            print(f"\n💾 Sauvegarde du PDF optimisé...", end=" ", flush=True)
+            elapsed = time.time() - t0
+            logger.info(f"Page {idx+1}: processed in {elapsed:.1f}s")
         
-        try:
-            out_doc.save(output_path, garbage=4, clean=True, deflate=True, deflate_images=True, deflate_fonts=True)
-        except Exception as e:
-            if verbose:
-                print(f"\n⚠️  Mode basique...", end=" ")
-            out_doc.save(output_path)
-        
-        if verbose:
-            print("✅")
-        
+        # Sauvegarde
+        out_doc.save(local_output, deflate=True, garbage=3, clean=True)
         out_doc.close()
         in_doc.close()
+        
+        logger.info(f"PDF saved: {local_output}")
+        
+        # Upload si GCS
+        if storage.is_gcs_path(output_path):
+            storage.upload(local_output, output_path)
 
 
-def parse_pages_selection(pages: str, total: int) -> List[int]:
-    if not pages:
-        return list(range(total))
-    selected = set()
-    for part in pages.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_str, end_str = part.split("-", 1)
-            start = int(start_str.strip()) if start_str.strip() else 1
-            end = int(end_str.strip()) if end_str.strip() else total
-            for p in range(start, end + 1):
-                if 1 <= p <= total:
-                    selected.add(p - 1)
-        else:
-            p = int(part)
-            if 1 <= p <= total:
-                selected.add(p - 1)
-    return sorted(selected)
-
+# ===================== CLI & CLOUD RUN =====================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="🔍 Pré-optimisation PDF pour OCR - NETTETÉ MAXIMALE")
+    p = argparse.ArgumentParser(description="OCR-optimized PDF processor (Cloud Run ready)")
     
-    p.add_argument("--input", "-i", help="📄 PDF d'entrée")
-    p.add_argument("--output", "-o", help="💾 PDF de sortie")
-    p.add_argument("--gui", "-g", action="store_true", help="🖱️  Mode interface graphique")
-    p.add_argument("--verbose", "-v", action="store_true", help="📊 Mode verbeux")
-    p.add_argument("--dpi", type=int, default=300, help="🎯 Résolution cible (défaut: 300)")
-    p.add_argument("--pages", type=str, default="", help="📑 Pages à traiter")
-    p.add_argument("--super-sample", type=float, default=1.5, help="🔍 Sur-échantillonnage (défaut: 1.5)")
-    p.add_argument("--keep-text-pages", dest="keep_text_pages", action="store_true", default=True)
-    p.add_argument("--no-keep-text-pages", dest="keep_text_pages", action="store_false")
-    p.add_argument("--normalize-background", dest="normalize_background", action="store_true", default=True)
-    p.add_argument("--no-normalize-background", dest="normalize_background", action="store_false")
-    p.add_argument("--clahe", action="store_true", default=True)
-    p.add_argument("--no-clahe", dest="clahe", action="store_false")
-    p.add_argument("--bilateral", action="store_true", default=True)
-    p.add_argument("--no-bilateral", dest="bilateral", action="store_false")
-    p.add_argument("--high-pass", dest="high_pass", action="store_true", default=True)
-    p.add_argument("--no-high-pass", dest="high_pass", action="store_false")
-    p.add_argument("--edge-enhance", dest="edge_enhance", action="store_true", default=True)
-    p.add_argument("--no-edge-enhance", dest="edge_enhance", action="store_false")
-    p.add_argument("--contrast-stretch", dest="contrast_stretch", action="store_true", default=True)
-    p.add_argument("--no-contrast-stretch", dest="contrast_stretch", action="store_false")
-    p.add_argument("--deskew", action="store_true", default=True)
-    p.add_argument("--no-deskew", dest="deskew", action="store_false")
-    p.add_argument("--crop", action="store_true", default=True)
-    p.add_argument("--no-crop", dest="crop", action="store_false")
-    p.add_argument("--denoise-h", type=int, default=7)
-    p.add_argument("--clahe-clip", type=float, default=2.5)
-    p.add_argument("--gamma", type=float, default=1.1)
-    p.add_argument("--unsharp", type=float, default=1.2)
-    p.add_argument("--unsharp-radius", type=float, default=1.5)
-    p.add_argument("--post-unsharp", type=float, default=0.7)
-    p.add_argument("--post-unsharp-radius", type=float, default=1.2)
-    p.add_argument("--binarize", choices=["none", "adaptive", "otsu"], default="none")
-    p.add_argument("--adaptive-block", type=int, default=31)
-    p.add_argument("--adaptive-C", type=int, default=11)
-    p.add_argument("--output-color", choices=["gray", "binary"], default="gray")
-    p.add_argument("--image-format", choices=["JPEG", "PNG"], default="PNG")
-    p.add_argument("--jpeg-quality", type=int, default=95)
+    # I/O
+    p.add_argument("--input", required=True, help="Input PDF (local or gs://)")
+    p.add_argument("--output", required=True, help="Output PDF (local or gs://)")
+    p.add_argument("--pages", help="Pages to process (e.g., '1,3-5,10')")
+    
+    # Résolution
+    p.add_argument("--dpi", type=int, default=400)
+    p.add_argument("--super-sample", type=float, default=1.5)
+    p.add_argument("--use-super-res", action="store_true", help="Use DNN super-resolution (slow)")
+    p.add_argument("--sr-model", choices=["EDSR", "ESPCN", "LapSRN"], default="EDSR")
+    
+    # Deskew
+    p.add_argument("--deskew-method", choices=["multi", "hough", "projection", "minAreaRect"], default="multi")
+    p.add_argument("--max-skew-deg", type=float, default=15.0)
+    p.add_argument("--no-deskew", action="store_true")
+    
+    # Binarisation
+    p.add_argument("--binarize", choices=["none", "adaptive", "otsu", "sauvola"], default="none")
+    
+    # Optimisations
+    p.add_argument("--enhance-digits", action="store_true", default=True)
+    p.add_argument("--no-enhance-digits", dest="enhance_digits", action="store_false")
+    
+    # Qualité
+    p.add_argument("--jpeg-quality", type=int, default=90)
+    
+    # Cloud Run
+    p.add_argument("--timeout", type=int, default=300, help="Global timeout (seconds)")
     
     args = p.parse_args()
     
-    if args.gui or not args.input or not args.output:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog, messagebox
-            
-            root = tk.Tk()
-            root.withdraw()
-            
-            if not args.input:
-                args.input = filedialog.askopenfilename(title="📄 Sélectionnez le PDF à optimiser", filetypes=[("PDF", "*.pdf"), ("Tous fichiers", "*.*")])
-            
-            if not args.input:
-                messagebox.showerror("Erreur", "❌ Aucun fichier sélectionné")
-                return None
-            
-            if not args.output:
-                base, _ = os.path.splitext(args.input)
-                default_name = os.path.basename(base) + "_SHARP.pdf"
-                args.output = filedialog.asksaveasfilename(title="💾 Enregistrer le PDF optimisé", defaultextension=".pdf", initialfile=default_name, filetypes=[("PDF", "*.pdf")])
-            
-            if not args.output:
-                messagebox.showerror("Erreur", "❌ Aucun fichier de sortie")
-                return None
-            
-            root.destroy()
-            
-        except ImportError:
-            if not args.input:
-                args.input = input("📄 Chemin PDF d'entrée : ").strip().strip('"\'')
-            if not args.output:
-                args.output = input("💾 Chemin PDF de sortie : ").strip().strip('"\'')
+    # Parse pages
+    page_list = None
+    if args.pages:
+        page_list = []
+        for part in args.pages.split(","):
+            if "-" in part:
+                start, end = map(int, part.split("-"))
+                page_list.extend(range(start-1, end))
+            else:
+                page_list.append(int(part) - 1)
     
-    if not os.path.exists(args.input):
-        p.error(f"❌ Fichier introuvable : {args.input}")
-    
-    if os.path.abspath(args.input) == os.path.abspath(args.output):
-        base, ext = os.path.splitext(args.input)
-        args.output = f"{base}_SHARP{ext}"
-        if args.verbose:
-            print(f"⚠️  Sortie renommée : {args.output}")
-    
-    cfg = PreoptConfig(
-        dpi=max(150, min(600, args.dpi)),
-        keep_text_pages=args.keep_text_pages,
-        normalize_background=args.normalize_background,
-        denoise_h=max(0, min(15, args.denoise_h)),
-        clahe=args.clahe,
-        clahe_clip=max(1.0, min(4.0, args.clahe_clip)),
-        clahe_tile=8,
-        gamma=max(0.5, min(2.0, args.gamma)),
-        bilateral=args.bilateral,
-        bilateral_d=9,
-        bilateral_sigma_color=75,
-        bilateral_sigma_space=75,
-        unsharp=max(0.0, min(3.0, args.unsharp)),
-        unsharp_radius=max(0.3, min(5.0, args.unsharp_radius)),
-        high_pass=args.high_pass,
-        high_pass_radius=5,
+    cfg = OCRConfig(
+        dpi=args.dpi,
+        super_sample=args.super_sample,
+        use_super_res=args.use_super_res,
+        sr_model=args.sr_model,
+        deskew=not args.no_deskew,
+        deskew_method=args.deskew_method,
+        max_skew_deg=args.max_skew_deg,
         binarize=args.binarize,
-        adaptive_block=max(11, args.adaptive_block),
-        adaptive_C=args.adaptive_C,
-        remove_speckles_area=15,
-        morph_open=1,
-        morph_close=1,
-        deskew=args.deskew,
-        max_skew_deg=10.0,
-        crop=args.crop,
-        crop_margin=10,
-        output_color=args.output_color,
-        image_format=args.image_format,
-        jpeg_quality=max(40, min(100, args.jpeg_quality)),
-        super_sample=max(1.0, min(3.0, args.super_sample)),
-        post_unsharp=max(0.0, min(3.0, args.post_unsharp)),
-        post_unsharp_radius=max(0.3, min(5.0, args.post_unsharp_radius)),
-        edge_enhance=args.edge_enhance,
-        contrast_stretch=args.contrast_stretch
+        enhance_digits=args.enhance_digits,
+        jpeg_quality=args.jpeg_quality,
     )
     
-    return args.input, args.output, cfg, args.pages, args.verbose
+    return args.input, args.output, cfg, page_list
 
 
 def main():
-    result = parse_args()
-    if result is None:
-        return 1
+    input_path, output_path, cfg, pages = parse_args()
     
-    input_path, output_path, cfg, pages_expr, verbose = result
+    storage = StorageHandler()
     
     try:
-        preoptimize_pdf(input_path, output_path, cfg, pages_expr, verbose)
-        
-        if verbose:
-            print()
-            print("╔═══════════════════════════════════════════════════════╗")
-            print("║            ✅ TRAITEMENT TERMINÉ AVEC SUCCÈS          ║")
-            print("╚═══════════════════════════════════════════════════════╝")
-            file_size = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"📁 Fichier    : {output_path}")
-            print(f"📊 Taille     : {file_size:.2f} MB")
-            print()
-        else:
-            print(f"✅ PDF optimisé créé : {output_path}")
-        
-        return 0
-    
-    except KeyboardInterrupt:
-        print("\n⚠️  Traitement interrompu par l'utilisateur")
-        return 130
-    
+        optimize_pdf(input_path, output_path, cfg, storage, pages)
+        logger.info("✅ Processing complete")
     except Exception as e:
-        print(f"\n❌ ERREUR : {e}")
-        if verbose:
-            import traceback
-            traceback.print_exc()
-        return 1
+        logger.error(f"❌ Processing failed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
