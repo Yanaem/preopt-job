@@ -1,4 +1,8 @@
-import argparse, os, subprocess, sys, tempfile
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
 from datetime import datetime, timezone
 
 from google.cloud import storage
@@ -15,6 +19,7 @@ def _parse_gs(gs_uri: str):
         raise ValueError(f"URI gs:// invalide: {gs_uri}")
     return parts[0], parts[1]
 
+
 def download(gcs_uri, local_path):
     bucket_name, blob_name = _parse_gs(gcs_uri)
     client = storage.Client()
@@ -22,6 +27,7 @@ def download(gcs_uri, local_path):
     if not blob.exists():
         raise FileNotFoundError(f"Objet introuvable: {gcs_uri}")
     blob.download_to_filename(local_path)
+
 
 def upload(local_path, gcs_uri):
     bucket_name, blob_name = _parse_gs(gcs_uri)
@@ -38,6 +44,7 @@ def upload(local_path, gcs_uri):
         ct = "text/plain; charset=utf-8"
 
     blob.upload_from_filename(local_path, content_type=ct)
+
 
 def _build_out_uri(input_uri: str, out_suffix: str, out_dir: str | None) -> str:
     in_bucket, in_blob = _parse_gs(input_uri)
@@ -58,6 +65,7 @@ def _build_out_uri(input_uri: str, out_suffix: str, out_dir: str | None) -> str:
     out_blob = f"{base_dir}/{new_name}" if base_dir else new_name
     return f"gs://{in_bucket}/{out_blob}"
 
+
 def _build_md_uri_from_output_pdf(output_pdf_uri: str) -> str:
     """
     gs://.../xxx_opt.pdf -> gs://.../xxx_opt_ocr.md
@@ -70,10 +78,42 @@ def _build_md_uri_from_output_pdf(output_pdf_uri: str) -> str:
     return f"gs://{out_bucket}/{md_blob}"
 
 
-# ---------- Supabase status (pour Lovable) ----------
+# ---------- Supabase config ----------
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET")  # ex: "invoices"
+SUPABASE_MD_PREFIX = os.environ.get("SUPABASE_MD_PREFIX", "").strip("/")  # ex: "ocr"
+
+
+def upload_md_to_supabase(local_md_path: str, storage_path: str) -> None:
+    """
+    Copie un .md local vers Supabase Storage.
+    storage_path = chemin dans le bucket (ex: 'ocr/xxx_opt_ocr.md').
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not SUPABASE_STORAGE_BUCKET:
+        print("[runner] SUPABASE_URL / SERVICE_KEY / STORAGE_BUCKET manquants, skip upload MD Supabase.", flush=True)
+        return
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "text/markdown; charset=utf-8",
+    }
+
+    with open(local_md_path, "rb") as f:
+        data = f.read()
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=30)
+        print(f"[runner] Upload Supabase MD -> {resp.status_code} {resp.text}", flush=True)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[runner] Erreur upload_md_to_supabase: {e}", flush=True)
+
+
+# ---------- Supabase status (pour Lovable) ----------
 
 def update_ocr_job(status: str, **extra_fields):
     """
@@ -196,7 +236,27 @@ def main():
                 print(f"[runner] Upload Markdown: {md_local} -> {md_gcs_uri}", flush=True)
                 upload(md_local, md_gcs_uri)
                 print(f"[runner] Terminé Markdown: {md_gcs_uri}", flush=True)
-                update_ocr_job("markdown_generated", optimized_pdf_path=args.output, markdown_path=md_gcs_uri)
+
+                # Upload vers Supabase Storage
+                _, gcs_blob = _parse_gs(md_gcs_uri)
+                _, md_filename = os.path.split(gcs_blob)  # ex: 'xxx_opt_ocr.md'
+                if SUPABASE_MD_PREFIX:
+                    supabase_md_path = f"{SUPABASE_MD_PREFIX}/{md_filename}"
+                else:
+                    supabase_md_path = md_filename
+
+                print(
+                    f"[runner] Upload Markdown vers Supabase: "
+                    f"{md_local} -> {SUPABASE_STORAGE_BUCKET}/{supabase_md_path}",
+                    flush=True,
+                )
+                upload_md_to_supabase(md_local, supabase_md_path)
+
+                update_ocr_job(
+                    "markdown_generated",
+                    optimized_pdf_path=args.output,
+                    markdown_path=supabase_md_path,  # chemin dans Supabase Storage
+                )
             else:
                 print("[runner] Aucun Markdown OCR trouvé (out_ocr.md), skip upload.", flush=True)
 
