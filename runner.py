@@ -1,7 +1,8 @@
 import argparse, os, subprocess, sys, tempfile
-from google.cloud import storage
-import requests  # déjà ajouté pour Claude, on le réutilise
+from datetime import datetime, timezone
 
+from google.cloud import storage
+import requests
 
 # ---------- GCS utils ----------
 
@@ -59,7 +60,7 @@ def _build_out_uri(input_uri: str, out_suffix: str, out_dir: str | None) -> str:
 
 def _build_md_uri_from_output_pdf(output_pdf_uri: str) -> str:
     """
-    À partir de l'URI gs://.../xxx_opt.pdf -> gs://.../xxx_opt_ocr.md
+    gs://.../xxx_opt.pdf -> gs://.../xxx_opt_ocr.md
     """
     out_bucket, out_blob = _parse_gs(output_pdf_uri)
     base_dir, base_name = os.path.split(out_blob)
@@ -67,6 +68,44 @@ def _build_md_uri_from_output_pdf(output_pdf_uri: str) -> str:
     md_name = stem + "_ocr.md"
     md_blob = f"{base_dir}/{md_name}" if base_dir else md_name
     return f"gs://{out_bucket}/{md_blob}"
+
+
+# ---------- Supabase status (pour Lovable) ----------
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+def update_ocr_job(status: str, **extra_fields):
+    """
+    Met à jour la ligne ocr_jobs avec l'id OCR_JOB_ID (ENV).
+    fields supplémentaires : optimized_pdf_path, markdown_path, error, etc.
+    """
+    job_id = os.environ.get("OCR_JOB_ID")
+    if not job_id:
+        print("[runner] OCR_JOB_ID non défini, skip update_ocr_job.", flush=True)
+        return
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("[runner] SUPABASE_URL / SUPABASE_SERVICE_KEY manquants, skip update_ocr_job.", flush=True)
+        return
+
+    url = f"{SUPABASE_URL}/rest/v1/ocr_jobs?id=eq.{job_id}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    body = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    body.update(extra_fields)
+    try:
+        resp = requests.patch(url, json=body, headers=headers, timeout=10)
+        print(f"[runner] update_ocr_job status={status} -> {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"[runner] Erreur update_ocr_job: {e}", flush=True)
+
 
 # ---------- Runner ----------
 
@@ -85,13 +124,12 @@ def main():
                    help="Tout ce qui suit est transmis au script principal")
     args = p.parse_args()
 
-    # Normalise d’éventuels tirets longs “–” collés depuis l’UI
+    # Normalise d’éventuels tirets longs “–”
     args.extra = [a.replace("–", "-") for a in args.extra]
 
-    # --------- Fallback via ENV ----------
+    # Fallback via ENV
     env_input = os.environ.get("GCS_INPUT")
     env_output = os.environ.get("GCS_OUTPUT")
-    env_auto_output = os.environ.get("GCS_AUTO_OUTPUT", "")
     env_out_dir = os.environ.get("GCS_OUT_DIR")
     env_out_suffix = os.environ.get("GCS_OUT_SUFFIX")
 
@@ -101,29 +139,30 @@ def main():
         args.out_dir = env_out_dir
     if args.out_suffix == "_opt" and env_out_suffix:
         args.out_suffix = env_out_suffix
-    if (not args.auto_output) and (env_auto_output.lower() in ("1", "true", "yes")):
-        args.auto_output = True
+
     if not args.output and env_output:
         args.output = env_output
 
     if not args.input:
         raise ValueError("Fournir --input OU définir ENV GCS_INPUT")
-    if not args.output and not args.auto_output:
-        raise ValueError("Fournir --output OU activer auto-output (--auto-output ou ENV GCS_AUTO_OUTPUT=true)")
 
-    if not args.output and args.auto_output:
+    # Auto-output PAR DÉFAUT si output manquant
+    if not args.output:
         args.output = _build_out_uri(args.input, args.out_suffix, args.out_dir)
+        args.auto_output = True
 
     print(f"[runner] input  = {args.input}", flush=True)
     print(f"[runner] output = {args.output}", flush=True)
     print(f"[runner] script = {args.script}", flush=True)
     print(f"[runner] extra  = {args.extra}", flush=True)
 
+    update_ocr_job("running")
+
     try:
         with tempfile.TemporaryDirectory() as td:
             in_local  = os.path.join(td, "in.pdf")
             out_local = os.path.join(td, "out.pdf")
-            md_local  = os.path.join(td, "out_ocr.md")  # là où le script va écrire le markdown
+            md_local  = os.path.join(td, "out_ocr.md")  # le script OCR écrit ici
 
             print(f"[runner] Téléchargement: {args.input} -> {in_local}", flush=True)
             download(args.input, in_local)
@@ -139,28 +178,33 @@ def main():
                 print("[script][stderr]\n" + proc.stderr, flush=True)
             if proc.returncode != 0:
                 print(f"[runner] Script exit code={proc.returncode}", flush=True)
+                update_ocr_job("failed", error=f"Script exit code {proc.returncode}")
                 sys.exit(proc.returncode)
 
             if not os.path.exists(out_local) or os.path.getsize(out_local) == 0:
-                raise RuntimeError("Le script n'a pas produit de fichier de sortie")
+                raise RuntimeError("Le script n'a pas produit de fichier PDF de sortie")
 
-            # Upload du PDF optimisé
+            # Upload PDF optimisé
             print(f"[runner] Upload PDF: {out_local} -> {args.output}", flush=True)
             upload(out_local, args.output)
             print(f"[runner] Terminé PDF: {args.output}", flush=True)
+            update_ocr_job("pdf_optimized", optimized_pdf_path=args.output)
 
-            # Tentative d'upload du Markdown OCR global (si généré)
+            # Upload Markdown si présent
             if os.path.exists(md_local) and os.path.getsize(md_local) > 0:
                 md_gcs_uri = _build_md_uri_from_output_pdf(args.output)
                 print(f"[runner] Upload Markdown: {md_local} -> {md_gcs_uri}", flush=True)
                 upload(md_local, md_gcs_uri)
                 print(f"[runner] Terminé Markdown: {md_gcs_uri}", flush=True)
+                update_ocr_job("markdown_generated", optimized_pdf_path=args.output, markdown_path=md_gcs_uri)
             else:
                 print("[runner] Aucun Markdown OCR trouvé (out_ocr.md), skip upload.", flush=True)
 
     except Exception as e:
         print(f"[runner][ERROR] {type(e).__name__}: {e}", flush=True)
+        update_ocr_job("failed", error=str(e))
         sys.exit(1)
+
 
 if __name__ == "__main__":
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
