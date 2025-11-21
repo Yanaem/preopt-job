@@ -29,6 +29,10 @@ import numpy as np
 import cv2
 from PIL import Image
 
+from claude_ocr import (
+    ocr_pdf_to_markdown_batched,
+    save_markdown
+)
 
 # --------------------- Config ---------------------
 
@@ -547,11 +551,33 @@ def parse_args():
 
 def main():
     in_path, out_path, cfg, pages_expr, verbose = parse_args()
+
+    # --- ÉTAPE 1 : pré-optimisation PDF (inchangée)
     preoptimize_pdf(in_path, out_path, cfg, pages_expr=pages_expr, verbose=verbose)
     if verbose:
         print(f"✅ PDF optimisé écrit dans: {out_path}")
 
+    # --- ÉTAPE 2 : OCR CLAUDE (batch de 5 pages)
+    base, _ = os.path.splitext(out_path)
+    md_path = base + "_ocr.md"
+
+    try:
+        if verbose:
+            print("[OCR] Démarrage OCR Claude par lots de 5 pages...")
+
+        # OCR par lots
+        markdown = ocr_pdf_to_markdown_batched(out_path, batch_size=5)
+
+        # Sauvegarde
+        save_markdown(markdown, md_path)
+
+        if verbose:
+            print(f"[OCR] Markdown global sauvegardé dans: {md_path}")
+            print(f"[OCR] Longueur totale: {len(markdown)} caractères")
+
+    except Exception as e:
+        print(f"[OCR] Erreur: {e}", flush=True)
+        # On ne casse pas le job, on log seulement.
 
 if __name__ == "__main__":
     main()
-
