@@ -1,5 +1,7 @@
 import argparse, os, subprocess, sys, tempfile
 from google.cloud import storage
+import requests  # déjà ajouté pour Claude, on le réutilise
+
 
 # ---------- GCS utils ----------
 
