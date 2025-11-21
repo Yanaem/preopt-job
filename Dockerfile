@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copier uniquement ce qui est nécessaire pour exécuter le job
 COPY preopt_pdf_sharp_petitfinmarche.py /app/
+COPY claude_ocr.py /app/
 COPY runner.py /app/
 
 # Cloud Run Jobs concatènera les --args après l'ENTRYPOINT
