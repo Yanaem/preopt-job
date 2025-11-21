@@ -24,8 +24,17 @@ def upload(local_path, gcs_uri):
     bucket_name, blob_name = _parse_gs(gcs_uri)
     client = storage.Client()
     blob = client.bucket(bucket_name).blob(blob_name)
-    content_type = "application/pdf" if local_path.lower().endswith(".pdf") else None
-    blob.upload_from_filename(local_path, content_type=content_type)
+
+    ct = None
+    lp = local_path.lower()
+    if lp.endswith(".pdf"):
+        ct = "application/pdf"
+    elif lp.endswith(".md"):
+        ct = "text/markdown; charset=utf-8"
+    elif lp.endswith(".txt"):
+        ct = "text/plain; charset=utf-8"
+
+    blob.upload_from_filename(local_path, content_type=ct)
 
 def _build_out_uri(input_uri: str, out_suffix: str, out_dir: str | None) -> str:
     in_bucket, in_blob = _parse_gs(input_uri)
@@ -43,15 +52,24 @@ def _build_out_uri(input_uri: str, out_suffix: str, out_dir: str | None) -> str:
         out_blob = f"{out_prefix}/{new_name}" if out_prefix else new_name
         return f"gs://{out_bucket}/{out_blob}"
 
-    # Par défaut: même dossier que l’entrée
     out_blob = f"{base_dir}/{new_name}" if base_dir else new_name
     return f"gs://{in_bucket}/{out_blob}"
+
+def _build_md_uri_from_output_pdf(output_pdf_uri: str) -> str:
+    """
+    À partir de l'URI gs://.../xxx_opt.pdf -> gs://.../xxx_opt_ocr.md
+    """
+    out_bucket, out_blob = _parse_gs(output_pdf_uri)
+    base_dir, base_name = os.path.split(out_blob)
+    stem, _ = os.path.splitext(base_name)
+    md_name = stem + "_ocr.md"
+    md_blob = f"{base_dir}/{md_name}" if base_dir else md_name
+    return f"gs://{out_bucket}/{md_blob}"
 
 # ---------- Runner ----------
 
 def main():
     p = argparse.ArgumentParser(description="GCS -> script PDF -> GCS (args UI + ENV fallbacks)")
-    # NOTE: --input/--output désormais OPTIONNELS (fallback ENV)
     p.add_argument("--input", required=False, help="gs://... (sinon ENV GCS_INPUT)")
     p.add_argument("--output", required=False, help="gs://... (sinon auto-output ou ENV GCS_OUTPUT)")
     p.add_argument("--auto-output", action="store_true",
@@ -68,41 +86,33 @@ def main():
     # Normalise d’éventuels tirets longs “–” collés depuis l’UI
     args.extra = [a.replace("–", "-") for a in args.extra]
 
-    # --------- Fallback via ENV (ne PAS casser les args UI du Job) ----------
+    # --------- Fallback via ENV ----------
     env_input = os.environ.get("GCS_INPUT")
     env_output = os.environ.get("GCS_OUTPUT")
     env_auto_output = os.environ.get("GCS_AUTO_OUTPUT", "")
     env_out_dir = os.environ.get("GCS_OUT_DIR")
     env_out_suffix = os.environ.get("GCS_OUT_SUFFIX")
 
-    # --input
     if not args.input and env_input:
         args.input = env_input
-
-    # --out-dir / --out-suffix / --auto-output
     if not args.out_dir and env_out_dir:
         args.out_dir = env_out_dir
     if args.out_suffix == "_opt" and env_out_suffix:
         args.out_suffix = env_out_suffix
     if (not args.auto_output) and (env_auto_output.lower() in ("1", "true", "yes")):
         args.auto_output = True
-
-    # --output
     if not args.output and env_output:
         args.output = env_output
 
-    # Validations minimales
     if not args.input:
         raise ValueError("Fournir --input OU définir ENV GCS_INPUT")
     if not args.output and not args.auto_output:
         raise ValueError("Fournir --output OU activer auto-output (--auto-output ou ENV GCS_AUTO_OUTPUT=true)")
 
-    # Résolution auto-output si nécessaire
     if not args.output and args.auto_output:
         args.output = _build_out_uri(args.input, args.out_suffix, args.out_dir)
 
-    # Logs utiles (diagnostic)
-    print(f"[runner] input = {args.input}", flush=True)
+    print(f"[runner] input  = {args.input}", flush=True)
     print(f"[runner] output = {args.output}", flush=True)
     print(f"[runner] script = {args.script}", flush=True)
     print(f"[runner] extra  = {args.extra}", flush=True)
@@ -111,6 +121,7 @@ def main():
         with tempfile.TemporaryDirectory() as td:
             in_local  = os.path.join(td, "in.pdf")
             out_local = os.path.join(td, "out.pdf")
+            md_local  = os.path.join(td, "out_ocr.md")  # là où le script va écrire le markdown
 
             print(f"[runner] Téléchargement: {args.input} -> {in_local}", flush=True)
             download(args.input, in_local)
@@ -131,9 +142,19 @@ def main():
             if not os.path.exists(out_local) or os.path.getsize(out_local) == 0:
                 raise RuntimeError("Le script n'a pas produit de fichier de sortie")
 
-            print(f"[runner] Upload: {out_local} -> {args.output}", flush=True)
+            # Upload du PDF optimisé
+            print(f"[runner] Upload PDF: {out_local} -> {args.output}", flush=True)
             upload(out_local, args.output)
-            print(f"[runner] Terminé: {args.output}", flush=True)
+            print(f"[runner] Terminé PDF: {args.output}", flush=True)
+
+            # Tentative d'upload du Markdown OCR global (si généré)
+            if os.path.exists(md_local) and os.path.getsize(md_local) > 0:
+                md_gcs_uri = _build_md_uri_from_output_pdf(args.output)
+                print(f"[runner] Upload Markdown: {md_local} -> {md_gcs_uri}", flush=True)
+                upload(md_local, md_gcs_uri)
+                print(f"[runner] Terminé Markdown: {md_gcs_uri}", flush=True)
+            else:
+                print("[runner] Aucun Markdown OCR trouvé (out_ocr.md), skip upload.", flush=True)
 
     except Exception as e:
         print(f"[runner][ERROR] {type(e).__name__}: {e}", flush=True)
